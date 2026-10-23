@@ -28,12 +28,13 @@ STATE_PATH = Path(
 )
 LOCK_PATH = STATE_PATH.with_suffix(STATE_PATH.suffix + ".lock")
 
-SUPPORTED_PROVIDERS = ("cloudflare", "cloudmail", "moemail", "yyds")
+SUPPORTED_PROVIDERS = ("cloudflare", "cloudmail", "moemail", "yyds", "openai_cpa")
 PROVIDER_LABELS = {
     "cloudflare": "Cloudflare",
     "cloudmail": "CloudMail",
     "moemail": "MoeMail",
     "yyds": "YYDS",
+    "openai_cpa": "OpenAI-CPA 内存池",
 }
 MAX_IMPORT_ITEMS = 500
 MAX_ACTIVE_LIMIT = 100

@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,6 +22,7 @@ from webui import email_domain_store
 from webui import email_provider_store
 from webui import process_utils
 from webui import proxy_store
+from email_providers import openai_cpa
 
 
 def test_compat_process_roots_require_existing_absolute_paths():
@@ -510,6 +514,254 @@ def test_start_reports_unavailable_process_table():
             os.environ["MONITOR_TOKEN"] = previous_token
 
 
+def test_monitor_server_swallows_connection_aborts():
+    server = monitor.MonitorHTTPServer(("127.0.0.1", 0), monitor.Handler)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            for exc in (
+                ConnectionAbortedError(10053, "aborted"),
+                ConnectionResetError(10054, "reset"),
+                BrokenPipeError(32, "broken pipe"),
+            ):
+                try:
+                    raise exc
+                except Exception:
+                    server.handle_error(("req", ("127.0.0.1", 51000)), ("127.0.0.1", 51001))
+        assert captured.getvalue() == ""
+
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            try:
+                raise RuntimeError("boom")
+            except Exception:
+                server.handle_error(("req", ("127.0.0.1", 51000)), ("127.0.0.1", 51001))
+        assert "RuntimeError: boom" in captured.getvalue()
+    finally:
+        server.server_close()
+
+
+def test_process_running_groups_single_scan_and_cache():
+    calls = []
+
+    def fake_scan(root, script_names):
+        calls.append(tuple(script_names))
+        return [
+            {
+                "pid": 4321,
+                "pgid": 4321,
+                "etime": "00:01",
+                "cmd": "python run_until_100.py",
+                "scripts": ["run_until_100.py"],
+            },
+            {
+                "pid": 4322,
+                "pgid": 4323,
+                "etime": "00:02",
+                "cmd": "python run_batch_headless.py 20 3",
+                "scripts": ["run_batch_headless.py"],
+            },
+        ]
+
+    previous_scan = monitor.find_managed_processes_detailed
+    previous_cache = dict(monitor._PROC_RUNNING_CACHE)
+    monitor.find_managed_processes_detailed = fake_scan
+    monitor._PROC_RUNNING_CACHE.update({"at": 0.0, "info": None})
+    try:
+        info = monitor.process_running(max_age=0.0)
+        assert info["running"] is True
+        assert info["orch_running"] is True and info["orch_pid"] == 4321
+        assert info["batch_running"] is True and info["batch_pid"] == 4322
+        assert info["pid"] == 4321
+        assert calls == [("run_until_100.py", "run_batch_headless.py")]
+
+        calls.clear()
+        second = monitor.process_running(max_age=60.0)
+        assert second == info
+        assert calls == []
+
+        third = monitor.process_running(max_age=0.0)
+        assert calls == [("run_until_100.py", "run_batch_headless.py")]
+        assert third["pid"] == 4321
+    finally:
+        monitor.find_managed_processes_detailed = previous_scan
+        monitor._PROC_RUNNING_CACHE.clear()
+        monitor._PROC_RUNNING_CACHE.update(previous_cache)
+
+
+def test_manage_processes_detailed_reports_scripts_only_for_cwd_root():
+    class FakeProcess:
+        def __init__(self, pid, cwd, command):
+            self.info = {
+                "pid": pid,
+                "cwd": str(cwd),
+                "cmdline": command,
+                "create_time": time.time() - 65,
+            }
+
+    roots = (
+        monitor.ROOT if hasattr(monitor, "ROOT") else Path(__file__).resolve().parents[1]
+    )
+    processes = [
+        FakeProcess(5511, roots, [sys.executable, str(monitor.ORCH_SCRIPT)]),
+        FakeProcess(5522, roots, [sys.executable, str(monitor.ORCH_SCRIPT), str(roots / "run_batch_headless.py"), "20"]),
+    ]
+    original_process_iter = process_utils.psutil.process_iter
+    try:
+        process_utils.psutil.process_iter = lambda **_kwargs: iter(processes)
+        found = process_utils.find_managed_processes_detailed(
+            roots, ("run_until_100.py", "run_batch_headless.py")
+        )
+        plain = process_utils.find_managed_processes(
+            roots, ("run_until_100.py", "run_batch_headless.py")
+        )
+    finally:
+        process_utils.psutil.process_iter = original_process_iter
+
+    assert [item["pid"] for item in found] == [5511, 5522]
+    assert found[0]["scripts"] == ["run_until_100.py"]
+    assert found[1]["scripts"] == ["run_batch_headless.py", "run_until_100.py"]
+    assert all("scripts" not in item for item in plain)
+
+
+def test_email_webhook_auth_and_pool_ingestion():
+    token = "test-webhook-token-123456"
+    secret = "webhook-secret-value"
+    previous_token = os.environ.get("MONITOR_TOKEN")
+    previous_config = (email_provider_store.CONFIG_PATH, email_provider_store.LOCK_PATH)
+    previous_pool = os.environ.get("OPENAI_CPA_POOL_DIR")
+    os.environ["MONITOR_TOKEN"] = token
+    raw_email = (
+        "From: xAI <noreply@x.ai>\n"
+        "Subject: Your code\n"
+        "\n"
+        "Your verification code: ABC-XYZ\n"
+    )
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            email_provider_store.CONFIG_PATH = base / "config.json"
+            email_provider_store.LOCK_PATH = base / "config.json.lock"
+            os.environ["OPENAI_CPA_POOL_DIR"] = str(base / "pool")
+            email_provider_store.atomic_write_json(
+                email_provider_store.CONFIG_PATH,
+                {"openai_cpa_webhook_secret": secret},
+            )
+            server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+
+            def post(path: str, *, payload=None, secret_header: str = "x", token_value: str = ""):
+                headers = {}
+                if secret_header is not None:
+                    headers["X-Webhook-Secret"] = secret_header
+                if token_value:
+                    headers["Authorization"] = f"Bearer {token_value}"
+                data = json.dumps(payload).encode("utf-8") if payload is not None else b""
+                req = urllib.request.Request(
+                    base_url + path, data=data, headers=headers, method="POST"
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        return response.status, json.loads(response.read())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read())
+
+            push = {"to_addr": "user@example.test", "raw_content": raw_email}
+
+            # 未配置/email-provider config 缺密钥的路径已在本用例保证；先验鉴权矩阵
+            status, body = post(monitor.WEBHOOK_EMAIL_PATH, payload=push, secret_header="wrong")
+            assert status == 401 and body["ok"] is False
+
+            status, body = post(
+                monitor.WEBHOOK_EMAIL_PATH, payload=push, secret_header=secret
+            )
+            assert status == 200 and body["stored"] is True
+            code = openai_cpa.pop_code(str(base / "pool"), "user@example.test")
+            assert code == "ABC-XYZ"
+
+            # 无效收件地址
+            status, _ = post(
+                monitor.WEBHOOK_EMAIL_PATH,
+                payload={"to_addr": "..", "raw_content": raw_email},
+                secret_header=secret,
+            )
+            assert status == 400
+            # 非 JSON
+            req = urllib.request.Request(
+                base_url + monitor.WEBHOOK_EMAIL_PATH,
+                data=b"{-not json",
+                headers={"X-Webhook-Secret": secret},
+                method="POST",
+            )
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                raise AssertionError("expected 400")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400
+
+            # 其他 POST 仍需 MONITOR_TOKEN
+            status, _ = post("/api/control", payload={}, secret_header=None)
+            assert status == 401
+            status, _ = post("/api/control", payload={}, secret_header=None, token_value=token)
+            assert status == 200
+
+            # GET 状态端点受运维 token 保护，不回显密钥
+            status, _, body_bytes = request(base_url + "/api/email-webhook")
+            assert status == 401
+            status, _, body_bytes = request(base_url + "/api/email-webhook", token=token)
+            payload = json.loads(body_bytes)
+            assert status == 200
+            assert payload["secret_configured"] is True
+            assert payload["path"] == "/api/webhook/email"
+            assert "webhook-secret-value" not in body_bytes.decode("utf-8")
+            assert raw_email not in body_bytes.decode("utf-8")
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+    finally:
+        if previous_token is None:
+            os.environ.pop("MONITOR_TOKEN", None)
+        else:
+            os.environ["MONITOR_TOKEN"] = previous_token
+        email_provider_store.CONFIG_PATH, email_provider_store.LOCK_PATH = previous_config
+        if previous_pool is None:
+            os.environ.pop("OPENAI_CPA_POOL_DIR", None)
+        else:
+            os.environ["OPENAI_CPA_POOL_DIR"] = previous_pool
+
+
+def test_email_webhook_fails_closed_without_secret():
+    class FakeMain:
+        pass
+
+    previous_config = (email_provider_store.CONFIG_PATH, email_provider_store.LOCK_PATH)
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            email_provider_store.CONFIG_PATH = base / "missing.json"
+            email_provider_store.LOCK_PATH = base / "missing.json.lock"
+            server = monitor.ThreadingHTTPServer(("127.0.0.1", 0), monitor.Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_port}"
+            try:
+                req = urllib.request.Request(
+                    base_url + monitor.WEBHOOK_EMAIL_PATH,
+                    data=b"{}",
+                    headers={"X-Webhook-Secret": "anything", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=5)
+                raise AssertionError("expected 503 fail-closed")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 503
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+    finally:
+        email_provider_store.CONFIG_PATH, email_provider_store.LOCK_PATH = previous_config
+
+
 if __name__ == "__main__":
     test_compat_process_roots_require_existing_absolute_paths()
     test_process_discovery_aggregates_explicit_release_roots()
@@ -520,4 +772,9 @@ if __name__ == "__main__":
     test_email_provider_api_auth_secret_masking_and_probe()
     test_non_loopback_requires_token()
     test_start_reports_unavailable_process_table()
+    test_monitor_server_swallows_connection_aborts()
+    test_process_running_groups_single_scan_and_cache()
+    test_manage_processes_detailed_reports_scripts_only_for_cwd_root()
+    test_email_webhook_auth_and_pool_ingestion()
+    test_email_webhook_fails_closed_without_secret()
     print("OK monitor http")

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -9,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import grok_register_ttk as register
+from email_providers import openai_cpa
 from webui import email_domain_store
 
 
@@ -27,14 +29,17 @@ def test_managed_domains_reach_all_supported_provider_adapters():
             "moemail_api_key",
             "yyds_api_key",
             "yyds_jwt",
+            "openai_cpa_webhook_secret",
         )
     }
     previous_functions = (
         register.cloudflare_provider.create_temp_address,
         register.cloudmail_provider.create_mailbox,
         register.moemail_provider.create_mailbox,
+        register.openai_cpa_provider.create_mailbox,
         register.yyds_create_account,
     )
+    previous_env_secret = os.environ.get("EMAIL_WEBHOOK_SECRET")
     observed = {}
     with tempfile.TemporaryDirectory() as temp:
         base = Path(temp)
@@ -51,8 +56,10 @@ def test_managed_domains_reach_all_supported_provider_adapters():
                 "moemail_api_key": "not-used-in-test",
                 "yyds_api_key": "not-used-in-test",
                 "yyds_jwt": "",
+                "openai_cpa_webhook_secret": "not-used-in-test",
             }
         )
+        os.environ.pop("EMAIL_WEBHOOK_SECRET", None)
 
         def fake_cloudflare(*_args, **kwargs):
             observed["cloudflare"] = kwargs["domain"]
@@ -71,15 +78,22 @@ def test_managed_domains_reach_all_supported_provider_adapters():
             observed["yyds"] = domain
             return {"address": f"{local_part}@{domain}", "token": "yyds-token"}
 
+        def fake_openai_cpa(domains, username=""):
+            chosen = domains if isinstance(domains, str) else domains[0]
+            observed["openai_cpa"] = chosen
+            return f"{username or 'user'}@{chosen}", openai_cpa.SOURCE_LABEL
+
         register.cloudflare_provider.create_temp_address = fake_cloudflare
         register.cloudmail_provider.create_mailbox = fake_cloudmail
         register.moemail_provider.create_mailbox = fake_moemail
+        register.openai_cpa_provider.create_mailbox = fake_openai_cpa
         register.yyds_create_account = fake_yyds
         domains = {
             "cloudflare": "cf-mail.example.com",
             "cloudmail": "cloudmail.example.com",
             "moemail": "moe-mail.example.com",
             "yyds": "yyds-mail.example.com",
+            "openai_cpa": "cpa-mail.example.com",
         }
         try:
             for provider, domain in domains.items():
@@ -94,10 +108,15 @@ def test_managed_domains_reach_all_supported_provider_adapters():
                 register.cloudflare_provider.create_temp_address,
                 register.cloudmail_provider.create_mailbox,
                 register.moemail_provider.create_mailbox,
+                register.openai_cpa_provider.create_mailbox,
                 register.yyds_create_account,
             ) = previous_functions
             email_domain_store.STATE_PATH, email_domain_store.LOCK_PATH = previous_paths
             register.config.update(previous_config)
+            if previous_env_secret is None:
+                os.environ.pop("EMAIL_WEBHOOK_SECRET", None)
+            else:
+                os.environ["EMAIL_WEBHOOK_SECRET"] = previous_env_secret
 
 
 def test_managed_domain_is_passed_to_provider_and_blocks_without_fallback():

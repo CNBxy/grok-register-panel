@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Add an `openai_cpa` email provider for cloud catch-all mailboxes pushed by an existing Cloudflare Email Worker: the panel exposes `POST /api/webhook/email` (raw RFC822 payload via `X-Webhook-Secret` / `EMAIL_WEBHOOK_SECRET`, fail-closed 503 when unconfigured), a read-only `GET /api/email-webhook` status view, and a local file-backed code pool (`log/openai_cpa_pool`, `OPENAI_CPA_POOL_DIR` override) with 300 s TTL, 1000-entry cap, and worker can poll codes from a separate process. Provider id, config key, and endpoint stay compatible with the grok_reg-share webhook worker.
+
 ### Changed
 
 - 降智测试只按有没有 thinking 判定：有 thinking 为正常，没有为降智。不再用 Token/s / `burst` / `soft` 分档。

@@ -293,6 +293,31 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
                 ok = False
             return "邮箱API", ok, detail[:300]
 
+        if provider == "openai_cpa":
+            from email_providers import openai_cpa as openai_cpa_provider
+
+            secret = str(config.get("openai_cpa_webhook_secret") or "").strip()
+            if not secret:
+                return "邮箱API", False, "未配置 openai_cpa_webhook_secret（与邮件 Worker 一致）"
+            domains = openai_cpa_provider.parse_domains(config.get("defaultDomains"))
+            if not domains:
+                return "邮箱API", False, "未配置收信域名（defaultDomains 或域名池）"
+            pool_dir = openai_cpa_provider.default_pool_dir()
+            try:
+                from secure_files import ensure_private_dir
+
+                ensure_private_dir(pool_dir)
+            except Exception as exc:
+                return (
+                    "邮箱API",
+                    False,
+                    f"取码池目录不可写 {redact_log_line(str(exc))}",
+                )
+            detail = f"Webhook 通道已配置（面板 {openai_cpa_provider.WEBHOOK_PATH}）"
+            if domains:
+                detail += f"；域名 {','.join(domains)[:80]}"
+            return "邮箱API", True, detail
+
         return "邮箱API", True, f"提供商 {provider} 跳过深度探测"
     except Exception as exc:
         return "邮箱API", False, redact_log_line(str(exc))

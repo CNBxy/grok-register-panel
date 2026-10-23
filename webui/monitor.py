@@ -51,11 +51,13 @@ try:
     )
     from webui.email_provider_store import (
         read_email_provider_config,
+        read_webhook_secret as read_email_webhook_secret,
         save_email_provider_config,
         test_email_provider_config,
     )
     from webui.process_utils import (
         find_managed_processes,
+        find_managed_processes_detailed,
         terminate_managed_processes,
         write_pid_file,
     )
@@ -100,11 +102,13 @@ except ImportError:  # running as script from webui/
     )
     from email_provider_store import (  # type: ignore
         read_email_provider_config,
+        read_webhook_secret as read_email_webhook_secret,  # type: ignore
         save_email_provider_config,
         test_email_provider_config,
     )
     from process_utils import (  # type: ignore
         find_managed_processes,
+        find_managed_processes_detailed,
         terminate_managed_processes,
         write_pid_file,
     )
@@ -129,6 +133,9 @@ except ImportError:  # running as script from webui/
         redact_log_line,
         redact_proxy,
     )
+
+from email_providers import openai_cpa as openai_cpa_provider
+
 LOG_DIR = ROOT / "log"
 BATCH_TRAFFIC = LOG_DIR / "batch_traffic.json"
 BATCH_TRAFFIC_HISTORY = LOG_DIR / "batch_traffic_history.json"
@@ -169,6 +176,33 @@ def _configured_process_roots(
 MANAGED_PROCESS_ROOTS = _configured_process_roots()
 
 
+def accept_email_webhook_payload(payload, provided_secret, expected_secret):
+    """把 Worker 推送的原始邮件写入 OpenAI-CPA 共享取码池。"""
+    return openai_cpa_provider.accept_webhook(
+        payload,
+        provided_secret,
+        expected_secret,
+        pool_dir=openai_cpa_provider.default_pool_dir(),
+    )
+
+
+def email_webhook_status() -> dict:
+    """Webhook 通道只读状态（密钥只回是否已配置）。"""
+    try:
+        secret = read_email_webhook_secret()
+    except Exception:
+        secret = ""
+    stats = openai_cpa_provider.pool_stats(openai_cpa_provider.default_pool_dir())
+    return {
+        "ok": True,
+        "path": openai_cpa_provider.WEBHOOK_PATH,
+        "header": openai_cpa_provider.WEBHOOK_SECRET_HEADER,
+        "secret_configured": bool(secret),
+        "pending": stats["pending"],
+        "ttl_seconds": stats["ttl_seconds"],
+    }
+
+
 def _find_managed_processes(script_names) -> list[dict]:
     found = {}
     for root in MANAGED_PROCESS_ROOTS:
@@ -177,10 +211,29 @@ def _find_managed_processes(script_names) -> list[dict]:
     return sorted(found.values(), key=lambda item: int(item["pid"]))
 
 
+_SNAPSHOT_SCRIPT_NAMES = ("run_until_100.py", "run_batch_headless.py")
+_PROC_RUNNING_CACHE: dict = {"at": 0.0, "info": None}
+
+
+def _managed_process_groups() -> tuple[list[dict], list[dict]]:
+    """Classify one merged process-table scan into orch/batch item lists."""
+    merged = {}
+    for root in MANAGED_PROCESS_ROOTS:
+        for item in find_managed_processes_detailed(root, _SNAPSHOT_SCRIPT_NAMES):
+            merged[int(item["pid"])] = item
+    items = sorted(merged.values(), key=lambda item: int(item["pid"]))
+    orch = [item for item in items if "run_until_100.py" in item["scripts"]]
+    batch = [item for item in items if "run_batch_headless.py" in item["scripts"]]
+    return orch, batch
+
+
 def _terminate_managed_processes(script_names) -> list[int]:
     killed = set()
     for root in MANAGED_PROCESS_ROOTS:
         killed.update(terminate_managed_processes(root, script_names))
+    if killed:
+        # Drop the cached process scan so the next status poll reflects the stop.
+        _PROC_RUNNING_CACHE.update({"at": 0.0, "info": None})
     return sorted(killed)
 
 
@@ -196,6 +249,7 @@ ORCH_SCRIPT = ROOT / "run_until_100.py"
 CONTROL_LOCK = threading.RLock()
 START_LOCK = threading.Lock()
 MAX_REQUEST_BODY = 64 * 1024
+WEBHOOK_EMAIL_PATH = "/api/webhook/email"
 
 RE_OK = re.compile(r"\[\+\] 注册成功")
 RE_FAIL = re.compile(r"\[-\] 失败")
@@ -305,8 +359,26 @@ def read_base():
         return 0
 
 
-def process_running():
-    """Detect orch and/or batch workers."""
+def process_running(max_age: float = 1.0) -> dict:
+    """Detect orch and/or batch workers.
+
+    One process-table scan classifies both orchestrator and batch scripts;
+    results ride a short TTL cache so dashboard polling does not rescan.
+    Pass max_age=0.0 to force a fresh scan (start/stop gating).
+    """
+    now = time.time()
+    cached = _PROC_RUNNING_CACHE
+    if (
+        cached.get("info") is not None
+        and (now - cached.get("at", 0.0)) <= max(0.0, max_age)
+    ):
+        return dict(cached["info"])
+    info = _process_running_uncached()
+    _PROC_RUNNING_CACHE.update({"at": now, "info": info})
+    return dict(info)
+
+
+def _process_running_uncached() -> dict:
     info = {
         "running": False,
         "pid": None,
@@ -319,8 +391,7 @@ def process_running():
         "batch_pid": None,
         "batch_etime": None,
     }
-    orch = _find_managed_processes(("run_until_100.py",))
-    batch = _find_managed_processes(("run_batch_headless.py",))
+    orch, batch = _managed_process_groups()
 
     def primary(items):
         if not items:
@@ -713,7 +784,7 @@ def _registration_env() -> dict[str, str]:
 
 
 def _start_orch_unlocked():
-    proc = process_running()
+    proc = process_running(max_age=0.0)
     if proc.get("orch_running") or proc.get("batch_running"):
         return {"ok": False, "error": "already running", "process": proc}
     if _find_managed_processes(("sso_to_auth_json.py",)):
@@ -787,7 +858,7 @@ def start_orch():
 
 
 def _start_batch_only_unlocked():
-    proc = process_running()
+    proc = process_running(max_age=0.0)
     if proc.get("batch_running") or proc.get("orch_running"):
         return {"ok": False, "error": "already running", "process": proc}
     if _find_managed_processes(("sso_to_auth_json.py",)):
@@ -3156,7 +3227,7 @@ function renderEmailProviderFields(provider) {
     `<div class="field"><label for="mail-field-${esc(field.name)}">${esc(field.label)}</label>${emailProviderFieldControl(field)}</div>`
   ).join("") || '<div class="field"><label>服务配置</label><input disabled value="该服务商没有可编辑字段"/></div>';
   const domainProvider = document.getElementById("domain-provider");
-  if (domainProvider && ["cloudflare", "cloudmail", "moemail", "yyds"].includes(definition.id)) {
+  if (domainProvider && ["cloudflare", "cloudmail", "moemail", "yyds", "openai_cpa"].includes(definition.id)) {
     domainProvider.value = definition.id;
     if (domainData) renderEmailDomainPool(domainData);
   }
@@ -4171,6 +4242,44 @@ class Handler(BaseHTTPRequestHandler):
             or ""
         )
 
+    def _handle_email_webhook(self):
+        """邮件 Worker 推送入口（OpenAI-CPA 内存池）。
+
+        独立鉴权：`X-Webhook-Secret` 必须与 config.json 的
+        `openai_cpa_webhook_secret` 完全一致；未配置密钥时固定 503（fail-closed）。
+        不回显请求头，不记录原始邮件内容。
+        """
+        try:
+            expected_secret = read_email_webhook_secret()
+        except Exception as exc:
+            self._json(500, {"ok": False, "error": redact_log_line(str(exc))})
+            return
+        if not expected_secret:
+            self._json(503, {"ok": False, "error": "邮件 Webhook 通信密钥未配置"})
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n > openai_cpa_provider.WEBHOOK_BODY_LIMIT_BYTES:
+            self._json(413, {"ok": False, "error": "邮件请求体超过 2MB 限制"})
+            return
+        try:
+            payload = self._read_body(max_size=openai_cpa_provider.WEBHOOK_BODY_LIMIT_BYTES)
+        except OverflowError:
+            self._json(413, {"ok": False, "error": "邮件请求体超过 2MB 限制"})
+            return
+        except ValueError:
+            self._json(400, {"ok": False, "error": "请求体必须是 JSON 对象"})
+            return
+        provided_secret = self.headers.get("X-Webhook-Secret", "")
+        status, result = accept_email_webhook_payload(
+            payload,
+            provided_secret,
+            expected_secret,
+        )
+        self._json(status, result)
+
     def _require_write(self) -> bool:
         if check_token_optional_read(self._auth_header(), write=True):
             return True
@@ -4226,7 +4335,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/health":
             self._json(200, {"ok": True})
             return
-        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/bfs", "/api/sso-state", "/api/quality"):
+        if u.path in ("/api/status", "/api/blacklist", "/api/stats", "/api/control", "/api/recovery", "/api/proxies", "/api/email-provider", "/api/email-domains", "/api/email-webhook", "/api/bfs", "/api/sso-state", "/api/quality"):
             if not self._require_read():
                 return
         if u.path == "/api/status":
@@ -4294,10 +4403,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"ok": False, "error": redact_log_line(str(e))})
             return
+        if u.path == "/api/email-webhook":
+            try:
+                self._json(200, email_webhook_status())
+            except Exception as e:
+                self._json(500, {"ok": False, "error": redact_log_line(str(e))})
+            return
         self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
         u = urlparse(self.path)
+        # 邮件 Webhook：机器到机器推送，使用独立的 X-Webhook-Secret 强制鉴权
+        #（fail-closed：未配置密钥一律 503），不走 MONITOR_TOKEN 运维鉴权。
+        if u.path == WEBHOOK_EMAIL_PATH:
+            self._handle_email_webhook()
+            return
         # All POST endpoints require MONITOR_TOKEN
         if not self._require_write():
             return
@@ -4581,6 +4701,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": redact_log_line(str(exc))})
 
 
+class MonitorHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            # Client (browser polling/refresh) dropped the connection while the
+            # response was being written. Benign for a local polling panel.
+            return
+        super().handle_error(request, client_address)
+
+
 def main():
     host = BIND_HOST
     tok = expected_token()
@@ -4594,7 +4726,7 @@ def main():
         )
     ThreadingHTTPServer.allow_reuse_address = True
     try:
-        httpd = ThreadingHTTPServer((host, BIND_PORT), Handler)
+        httpd = MonitorHTTPServer((host, BIND_PORT), Handler)
     except OSError as e1:
         raise SystemExit(
             f"cannot bind {BIND_HOST}:{BIND_PORT} ({e1}); "

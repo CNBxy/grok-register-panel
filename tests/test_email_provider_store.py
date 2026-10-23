@@ -56,6 +56,7 @@ def test_provider_schema_and_defaults():
             "moemail",
             "outlook_rt",
             "inbucket",
+            "openai_cpa",
         }
         assert providers["outlook_rt"]["configured"] is False
         assert providers["outlook_rt"]["recommended"] is True
@@ -71,6 +72,12 @@ def test_provider_schema_and_defaults():
         assert providers["duckmail"]["configured"] is True
         assert providers["cloudmail"]["configured"] is False
         assert providers["inbucket"]["configured"] is False
+        assert providers["openai_cpa"]["configured"] is False
+        assert providers["openai_cpa"]["kind"] == "domain"
+        assert {field["name"] for field in providers["openai_cpa"]["fields"]} == {
+            "openai_cpa_webhook_secret",
+            "defaultDomains",
+        }
         assert {field["name"] for field in providers["inbucket"]["fields"]} == {
             "inbucket_api_base",
             "inbucket_domain",
@@ -319,6 +326,63 @@ def test_inbucket_requires_base_and_domain():
         )
 
 
+def test_openai_cpa_secret_masking_and_webhook_secret_reader():
+    with IsolatedConfig() as config_path:
+        previous_env = os.environ.pop("EMAIL_WEBHOOK_SECRET", None)
+        try:
+            saved = email_provider_store.save_email_provider_config(
+                "openai_cpa",
+                {
+                    "openai_cpa_webhook_secret": "webhook-secret-value",
+                    "defaultDomains": "Mail.Example.com, mail.example.com",
+                },
+            )
+            assert saved["provider"] == "openai_cpa"
+            assert saved["configured"] is True
+            assert saved["values"]["openai_cpa_webhook_secret"] == ""
+            assert saved["secret_configured"]["openai_cpa_webhook_secret"] is True
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            assert raw["openai_cpa_webhook_secret"] == "webhook-secret-value"
+            assert raw["defaultDomains"] == "mail.example.com"
+            assert (
+                email_provider_store.read_webhook_secret() == "webhook-secret-value"
+            )
+
+            # 留空保留已存密钥；显式 clear_secrets 才清除
+            email_provider_store.save_email_provider_config(
+                "openai_cpa",
+                {"openai_cpa_webhook_secret": "", "defaultDomains": "mail.example.com"},
+            )
+            preserved = json.loads(config_path.read_text(encoding="utf-8"))
+            assert preserved["openai_cpa_webhook_secret"] == "webhook-secret-value"
+
+            cleared = email_provider_store.save_email_provider_config(
+                "openai_cpa",
+                {"defaultDomains": "mail.example.com"},
+                clear_secrets=["openai_cpa_webhook_secret"],
+            )
+            assert cleared["configured"] is False
+            assert (
+                email_provider_store.read_webhook_secret() == ""
+            )
+
+            # 环境变量优先于 config.json
+            atomic_write_json(config_path, {"openai_cpa_webhook_secret": "from-config"})
+            os.environ["EMAIL_WEBHOOK_SECRET"] = "from-env"
+            assert email_provider_store.read_webhook_secret() == "from-env"
+
+            assert_config_error(
+                lambda: email_provider_store.save_email_provider_config(
+                    "openai_cpa", {"unknown_setting": "x"}
+                )
+            )
+        finally:
+            if previous_env is None:
+                os.environ.pop("EMAIL_WEBHOOK_SECRET", None)
+            else:
+                os.environ["EMAIL_WEBHOOK_SECRET"] = previous_env
+
+
 if __name__ == "__main__":
     test_provider_schema_and_defaults()
     test_secret_masking_preservation_clear_and_private_file()
@@ -328,4 +392,5 @@ if __name__ == "__main__":
     test_cloudflare_direct_create_does_not_probe_admin_domains()
     test_cloudflare_admin_create_does_not_probe_mailbox_domains()
     test_inbucket_requires_base_and_domain()
+    test_openai_cpa_secret_masking_and_webhook_secret_reader()
     print("OK email provider store")

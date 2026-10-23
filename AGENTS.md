@@ -39,6 +39,13 @@ bulk abuse.
   redacted API views. `webui/email_provider_store.py` owns provider config and
   secret-preserving updates. `webui/email_domain_store.py` owns domain rotation
   and rejection state.
+- `email_providers/openai_cpa.py` owns the catch-all webhook code pool:
+  ingestion, hashing, TTL/capacity pruning, and parsing stay inside the
+  adapter. `webui/monitor.py` only validates the `X-Webhook-Secret` secret and
+  forwards payloads; the webhook secret lives in `EMAIL_WEBHOOK_SECRET` /
+  `config.openai_cpa_webhook_secret` (never rendered or logged), and the pool
+  directory defaults to `log/openai_cpa_pool` (override via
+  `OPENAI_CPA_POOL_DIR`).
 - `runtime_platform.py` owns interpreter discovery, Xvfb selection, and process
   group flags. `webui/process_utils.py` owns project-scoped process discovery
   and termination.
@@ -124,6 +131,12 @@ screenshots.
 - Operational GET endpoints require a token when `MONITOR_TOKEN` is configured.
 - Every POST, PATCH, and DELETE operation requires `MONITOR_TOKEN`; an unset
   token does not make write operations public.
+- The single exception is `POST /api/webhook/email` (the `openai_cpa`
+  provider). It authenticates with its own `X-Webhook-Secret` compared against
+  `EMAIL_WEBHOOK_SECRET` or `config.openai_cpa_webhook_secret`, and fails
+  closed with 503 when no secret is configured. `GET /api/email-webhook`
+  remains a token-guarded read endpoint and must never disclose the secret or
+  raw mail content.
 - Accept tokens through `Authorization: Bearer` or `X-Monitor-Token`. Never add
   token query parameters, include tokens in URLs, or log request headers.
 - A non-loopback panel bind requires a strong token. Prefer an exact loopback,

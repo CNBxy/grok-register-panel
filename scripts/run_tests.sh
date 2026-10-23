@@ -29,6 +29,7 @@ tests=(
   tests/test_proxy_worker_integration.py
   tests/test_email_provider_store.py
   tests/test_inbucket.py
+  tests/test_openai_cpa.py
   tests/test_outlook_rt.py
   tests/test_email_domain_store.py
   tests/test_email_domain_worker_integration.py

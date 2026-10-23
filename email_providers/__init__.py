@@ -8,4 +8,5 @@
 - moemail: MoeMail OpenAPI
 - outlook_rt: 本地 Outlook MSA refresh_token 库存（jsonl）
 - inbucket: Inbucket 自托管临时邮箱
+- openai_cpa: 云邮箱 catch-all，Cloudflare Email Worker 推送验证码到本地池
 """

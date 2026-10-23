@@ -38,6 +38,7 @@ from email_providers import duckmail as duckmail_provider
 from email_providers import inbucket as inbucket_provider
 from email_providers import mailnest as mailnest_provider
 from email_providers import moemail as moemail_provider
+from email_providers import openai_cpa as openai_cpa_provider
 from email_providers import outlook_rt as outlook_rt_provider
 from email_providers import yyds as yyds_provider
 from email_providers.common import extract_verification_code as _extract_code
@@ -243,6 +244,8 @@ DEFAULT_CONFIG = {
     "inbucket_api_base": "",
     "inbucket_domain": "",
     "inbucket_random_levels": "0",
+    # OpenAI-CPA 内存池：与邮件 Worker 通信密钥（X-Webhook-Secret）
+    "openai_cpa_webhook_secret": "",
     # Outlook MSA refresh_token 库存（jsonl: email + refresh_token）
     "outlook_rt_inventory": "",
     "outlook_rt_used_path": "",
@@ -1815,6 +1818,55 @@ def cloudmail_get_oai_code(
     )
 
 
+def get_openai_cpa_webhook_secret():
+    """与邮件 Worker 约定的通信密钥（X-Webhook-Secret）。"""
+    return str(
+        os.environ.get("EMAIL_WEBHOOK_SECRET")
+        or config.get("openai_cpa_webhook_secret", "")
+        or ""
+    ).strip()
+
+
+def openai_cpa_pool_dir():
+    return openai_cpa_provider.default_pool_dir()
+
+
+def openai_cpa_get_email_and_token(domain=""):
+    if not get_openai_cpa_webhook_secret():
+        raise Exception(
+            "OpenAI-CPA 需要配置 openai_cpa_webhook_secret"
+            "（与邮件 Worker 的 X-Webhook-Secret 一致），且面板在线接收推送"
+        )
+    address, token = openai_cpa_provider.create_mailbox(
+        str(domain or "").strip() or config.get("defaultDomains", "")
+    )
+    print(f"[*] 已生成 OpenAI-CPA catch-all 邮箱: {address}")
+    return address, token
+
+
+def openai_cpa_get_oai_code(
+    dev_token,
+    email,
+    timeout=300,
+    poll_interval=0.3,
+    log_callback=None,
+    cancel_callback=None,
+    resend_callback=None,
+):
+    del dev_token
+    return openai_cpa_provider.wait_for_code(
+        openai_cpa_pool_dir(),
+        email,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        resend_callback=resend_callback,
+    )
+
+
 def get_email_provider():
     return str(config.get("email_provider", "cloudflare") or "cloudflare").strip().lower()
 
@@ -1880,6 +1932,8 @@ def get_email_and_token(api_key=None):
         return cloudmail_get_email_and_token(domain=managed_domain)
     if provider == "moemail":
         return moemail_get_email_and_token(domain=managed_domain)
+    if provider == "openai_cpa":
+        return openai_cpa_get_email_and_token(domain=managed_domain)
     if provider == "cloudflare":
         api_base = get_cloudflare_api_base()
         if not api_base:
@@ -2019,6 +2073,16 @@ def get_oai_code(
         )
     if provider == "moemail":
         return moemail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
+    if provider == "openai_cpa":
+        return openai_cpa_get_oai_code(
             dev_token,
             email,
             timeout=timeout,
@@ -2775,6 +2839,7 @@ class GrokRegisterGUI:
                 "cloudflare",
                 "cloudmail",
                 "moemail",
+                "openai_cpa",
             ],
             width=12,
         )
@@ -3092,6 +3157,41 @@ class GrokRegisterGUI:
             ),
         ]
 
+        # OpenAI-CPA 内存池（邮件 Worker Webhook 推送）
+        self.openai_cpa_webhook_secret_var = tk.StringVar(
+            value=str(config.get("openai_cpa_webhook_secret", "") or "")
+        )
+        self._openai_cpa_widgets = [
+            p_label(0, 0, "Webhook 密钥:"),
+            p_field(
+                tk_entry(
+                    self.provider_frame,
+                    textvariable=self.openai_cpa_webhook_secret_var,
+                    width=34,
+                    show="*",
+                ),
+                0,
+                1,
+            ),
+            p_label(0, 2, "收信域名:"),
+            p_field(tk_entry(self.provider_frame, textvariable=self.default_domains_var, width=34), 0, 3),
+            p_label(1, 0, "说明:"),
+            p_field(
+                tk_label(
+                    self.provider_frame,
+                    text="catch-all 收信；Worker 推送面板 /api/webhook/email，"
+                    "密钥与面板 openai_cpa_webhook_secret 一致",
+                    bg=UI_PANEL_BG,
+                    wraplength=420,
+                    justify=tk.LEFT,
+                ),
+                1,
+                1,
+                columnspan=3,
+                sticky=tk.W,
+            ),
+        ]
+
         self._provider_widget_groups = {
             "duckmail": self._duckmail_widgets,
             "cloudflare": self._cloudflare_widgets,
@@ -3100,6 +3200,7 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
             "moemail": self._moemail_widgets,
             "outlook_rt": self._outlook_rt_widgets,
+            "openai_cpa": self._openai_cpa_widgets,
         }
 
         add_label(3, 0, "并发数（可选）:")
@@ -3287,6 +3388,7 @@ class GrokRegisterGUI:
             "mailnest": "MailNest 配置",
             "cloudmail": "CloudMail 配置",
             "moemail": "MoeMail 配置",
+            "openai_cpa": "OpenAI-CPA 内存池配置（Webhook）",
             "outlook_rt": "Outlook RT 库存配置（推荐）",
         }
         self.provider_frame.configure(text=titles.get(provider, "邮箱服务商配置"))
@@ -3389,6 +3491,7 @@ class GrokRegisterGUI:
                 self.outlook_rt_client_id_var.get().strip()
                 or outlook_rt_provider.DEFAULT_CLIENT_ID
             )
+            config["openai_cpa_webhook_secret"] = self.openai_cpa_webhook_secret_var.get().strip()
             config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
             config["quality_probe_on_register"] = bool(self.quality_probe_on_register_var.get())
             _mode_text = str(self.cpa_token_mode_var.get()).strip()
@@ -3512,6 +3615,7 @@ class GrokRegisterGUI:
             self.outlook_rt_client_id_var.get().strip()
             or outlook_rt_provider.DEFAULT_CLIENT_ID
         )
+        config["openai_cpa_webhook_secret"] = self.openai_cpa_webhook_secret_var.get().strip()
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["quality_probe_on_register"] = bool(self.quality_probe_on_register_var.get())
         _mode_text = str(self.cpa_token_mode_var.get()).strip()
@@ -3572,6 +3676,18 @@ class GrokRegisterGUI:
                 missing.append("默认收信域名")
             if missing:
                 self.log(f"[!] CloudMail 模式缺少配置: {', '.join(missing)}")
+                return
+        if config["email_provider"] == "openai_cpa":
+            missing = []
+            if not get_openai_cpa_webhook_secret():
+                missing.append("Webhook 通信密钥（openai_cpa_webhook_secret）")
+            if not (self.default_domains_var.get().strip() or config.get("defaultDomains", "")):
+                missing.append("收信域名（defaultDomains）")
+            if missing:
+                self.log(
+                    f"[!] OpenAI-CPA 内存池模式缺少配置: {', '.join(missing)}"
+                    "｜还需保持面板运行以接收邮件 Worker 推送"
+                )
                 return
         if config.get("cpa_auto_add") and not config.get("cpa_auth_dir") and not config.get("cpa_remote_url") and not config.get("grok2api_auth_dir"):
             self.log("[!] 已开启 SSO→auth，但未配置 CPA auth 目录 / 远程地址 / Grok2API 目录")

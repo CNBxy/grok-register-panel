@@ -25,7 +25,7 @@ Based on [AaronL725/grok-register](https://github.com/AaronL725/grok-register) (
 | 能力 | 说明 |
 |------|------|
 | 注册全链路 | 邮箱 OTP → 资料页 → Turnstile → SSO → Device / OAuth → 写入 CPA / Grok2API |
-| 多邮箱后端 | **推荐 Outlook RT 库存**；也支持 DuckMail、MailNest、Cloudflare Worker 邮、YYDS、CloudMail、MoeMail、Inbucket 自建。域名邮箱不作为主路径 |
+| 多邮箱后端 | **推荐 Outlook RT 库存**；也支持 DuckMail、MailNest、Cloudflare Worker 邮、YYDS、CloudMail、MoeMail、Inbucket 自建、OpenAI-CPA 内存池（Webhook catch-all）。域名邮箱不作为主路径 |
 | 反检测浏览器 | [Camoufox](https://camoufox.com/)（Gecko 层指纹） |
 | 出口预检 | 启动前解析出口 IP / ASN，命中黑名单直接换口；**优先家宽** |
 | **降智测试** | `quality_probe_on_register` 打开后，入库才短测；有 thinking 记正常，缺 thinking 记降智，401/403 记风控。面板可复测存量号 |
@@ -141,7 +141,9 @@ Windows 不要把 `PLAYWRIGHT_NODEJS_PATH` 指到 `scripts/playwright-node`（�
 
 | 字段 | 说明 |
 |------|------|
-| `email_provider` | `cloudflare` / `duckmail` / `yyds` / `mailnest` / `cloudmail` / `moemail` / `outlook_rt` / `inbucket` |
+| `email_provider` | `cloudflare` / `duckmail` / `yyds` / `mailnest` / `cloudmail` / `moemail` / `outlook_rt` / `inbucket` / `openai_cpa` |
+| `openai_cpa_webhook_secret` | OpenAI-CPA 内存池 Webhook 密钥（`X-Webhook-Secret`；环境变量 `EMAIL_WEBHOOK_SECRET` 优先） |
+| `defaultDomains`（openai_cpa） | OpenAI-CPA 云邮箱 catch-all 域名，逗号分隔轮换（asleep[随机]@域名） |
 | `outlook_rt_inventory` | Outlook MSA 库存路径（jsonl：`email`+`refresh_token`；或 `email----rt`） |
 | `outlook_rt_used_path` | 已用邮箱记录（可选；默认 `库存路径.used`） |
 | `outlook_rt_client_id` | 可选 Client ID；默认 Microsoft Authentication Broker 公共客户端 |
@@ -331,9 +333,10 @@ python grok_register_ttk.py
 
 ### 邮箱服务与高级域名轮换
 
-- 顶部“邮箱服务”统一配置 `cloudflare`、`duckmail`、`yyds`、`mailnest`、`cloudmail`、`moemail`、`outlook_rt`、`inbucket`
+- 顶部“邮箱服务”统一配置 `cloudflare`、`duckmail`、`yyds`、`mailnest`、`cloudmail`、`moemail`、`outlook_rt`、`inbucket`、`openai_cpa`
 - `outlook_rt` 从本地 jsonl 库存取号（非购买），用 MSA `refresh_token` 刷 Graph 收 xAI 验证码
 - `inbucket` 使用自建 [Inbucket](https://github.com/inbucket/inbucket) 实例：填实例地址和收信根域名即可，邮箱即建即用，无需注册 API；根域名可配多个轮换，并可按 `inbucket_random_levels` 叠加随机多级子域（需泛解析收信）
+- `openai_cpa` 使用云邮箱 catch-all + Webhook 推送：在 Cloudflare Email Routing catch-all 上把现有 Email Worker 的推送目标指向面板 `/api/webhook/email`（推送原始 RFC822 邮件 JSON，沿用 `X-Webhook-Secret` 头与 `EMAIL_WEBHOOK_SECRET` 密钥，Worker 侧无需改动）。面板把验证码写入本地文件池（默认 `log/openai_cpa_pool`，可用 `OPENAI_CPA_POOL_DIR` 覆盖；按收件人哈希命名、TTL 300 秒、上限 1000 条，均为 0600/0700 权限）；注册 worker 生成 `前缀<随机>@<域名>` 邮箱后轮询本地池取码。**使用该模式时面板进程必须保持在线**，否则 Worker 推送会失败。响应码：200 已存储 / 202 无验证码 / 401 密钥错误 / 400 请求无效 / 413 超过 2MB / 503 未配置密钥（fail-closed）
 - 切换服务商时只显示该服务实际支持的字段；保存后新的注册任务读取 `config.json`
 - 已保存的 API Key、JWT 和密码不会通过接口或页面回显；密钥输入留空会保留原值，必须点“清除”并保存才会删除
 - “测试当前提供商”使用表单中的未保存内容做连通性检查，不会改写 `config.json`；`outlook_rt` 刷新成功时会原子保存上游轮换后的 RT，避免库存保留已失效凭据，但不会标记邮箱已用
@@ -341,7 +344,7 @@ python grok_register_ttk.py
 
 域名轮换位于邮箱服务页的高级设置中：
 
-- 支持导入根域名或已有子域名，并绑定 `cloudflare`、`cloudmail`、`moemail`、`yyds` provider
+- 支持导入根域名或已有子域名，并绑定 `cloudflare`、`cloudmail`、`moemail`、`yyds`、`openai_cpa` provider
 - 每个 provider 可设置最大活跃域名数；超出部分待命，活跃域名停用或拉黑后自动补位
 - xAI 明确拒绝邮箱域名时累计连续失败，达到阈值后自动拉黑；成功提交邮箱后清零连续失败
 - 邮箱 API、验证码超时和普通网络异常不会处罚域名，避免把基础设施故障误判成域名质量问题

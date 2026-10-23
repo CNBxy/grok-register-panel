@@ -28,6 +28,7 @@ PROVIDER_LABELS = {
     "cloudmail": "CloudMail",
     "moemail": "MoeMail",
     "inbucket": "Inbucket",
+    "openai_cpa": "OpenAI-CPA 内存池（Webhook）",
 }
 PROVIDER_KIND = {
     "outlook_rt": "mailbox",
@@ -38,6 +39,7 @@ PROVIDER_KIND = {
     "cloudmail": "domain",
     "moemail": "domain",
     "inbucket": "domain",
+    "openai_cpa": "domain",
 }
 PROVIDER_HINTS = {
     "outlook_rt": "推荐：Outlook 等真实邮箱，配合家宽出口",
@@ -48,6 +50,7 @@ PROVIDER_HINTS = {
     "cloudmail": "域名邮箱，容易被拒，不推荐作为主路径",
     "moemail": "域名邮箱，容易被拒，不推荐作为主路径",
     "inbucket": "自建域名邮箱，容易被拒，不推荐作为主路径",
+    "openai_cpa": "Webhook 接收验证码的域名邮箱，需面板在线收推送；容易被拒，不推荐作为主路径",
 }
 RECOMMENDED_PROVIDERS = ("outlook_rt",)
 DOMAIN_PROVIDERS = tuple(
@@ -228,6 +231,12 @@ FIELD_DEFINITIONS = {
             {"value": "1-3", "label": "随机 1-3 级子域"},
         ],
     },
+    "openai_cpa_webhook_secret": {
+        "label": "Webhook 通信密钥",
+        "type": "password",
+        "secret": True,
+        "placeholder": "与邮件 Worker 的 X-Webhook-Secret 一致",
+    },
 }
 
 PROVIDER_FIELDS = {
@@ -264,6 +273,7 @@ PROVIDER_FIELDS = {
         "outlook_rt_client_id",
     ),
     "inbucket": ("inbucket_api_base", "inbucket_domain", "inbucket_random_levels"),
+    "openai_cpa": ("openai_cpa_webhook_secret", "defaultDomains"),
 }
 
 SECRET_FIELDS = {
@@ -440,6 +450,8 @@ def _is_configured(provider: str, values: dict) -> bool:
         return bool(inventory and Path(inventory).expanduser().is_file())
     if provider == "inbucket":
         return bool(values.get("inbucket_api_base") and values.get("inbucket_domain"))
+    if provider == "openai_cpa":
+        return bool(values.get("openai_cpa_webhook_secret") and values.get("defaultDomains"))
     return False
 
 
@@ -490,6 +502,19 @@ def read_email_provider_config() -> dict:
     with exclusive_file_lock(LOCK_PATH):
         raw, error = _read_unlocked()
     return _public_state(raw, error)
+
+
+def read_webhook_secret() -> str:
+    """本机自用：读取 OpenAI-CPA 邮件 Webhook 通信密钥（不外发）。"""
+    with exclusive_file_lock(LOCK_PATH):
+        raw, error = _read_unlocked()
+    if error:
+        return ""
+    return str(
+        os.environ.get("EMAIL_WEBHOOK_SECRET")
+        or raw.get("openai_cpa_webhook_secret", "")
+        or ""
+    ).strip()
 
 
 def _candidate_config(
