@@ -66,20 +66,30 @@ def _resolved_arg(arg: str, cwd: Path) -> Path | None:
         return None
 
 
+def _snapshot_script_matches(
+    snapshot: dict,
+    root: str | os.PathLike[str],
+    script_names: tuple[str, ...] | list[str],
+) -> set[str]:
+    project_root = Path(root).resolve()
+    process_cwd = snapshot.get("cwd")
+    if process_cwd != project_root:
+        return set()
+    expected = {(project_root / name).resolve(): str(name) for name in script_names}
+    matched = set()
+    for arg in snapshot.get("cmdline") or []:
+        resolved = _resolved_arg(str(arg), process_cwd)
+        if resolved in expected:
+            matched.add(expected[resolved])
+    return matched
+
+
 def _snapshot_matches(
     snapshot: dict,
     root: str | os.PathLike[str],
     script_names: tuple[str, ...] | list[str],
 ) -> bool:
-    project_root = Path(root).resolve()
-    process_cwd = snapshot.get("cwd")
-    if process_cwd != project_root:
-        return False
-    expected = {(project_root / name).resolve() for name in script_names}
-    return any(
-        _resolved_arg(arg, process_cwd) in expected
-        for arg in snapshot.get("cmdline") or []
-    )
+    return bool(_snapshot_script_matches(snapshot, root, script_names))
 
 
 def process_matches(
@@ -106,10 +116,11 @@ def _format_elapsed(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def find_managed_processes(
+def find_managed_processes_detailed(
     root: str | os.PathLike[str],
     script_names: tuple[str, ...] | list[str],
 ) -> list[dict]:
+    """Like find_managed_processes, plus the matched script names per item."""
     found = []
     now = time.time()
     try:
@@ -119,7 +130,10 @@ def find_managed_processes(
         )
         for process in iterator:
             snapshot = _process_snapshot(process)
-            if not snapshot or not _snapshot_matches(snapshot, root, script_names):
+            if not snapshot:
+                continue
+            matched = _snapshot_script_matches(snapshot, root, script_names)
+            if not matched:
                 continue
             pid = snapshot["pid"]
             try:
@@ -134,6 +148,7 @@ def find_managed_processes(
                     "pgid": pgid,
                     "etime": etime,
                     "cmd": " ".join(snapshot["cmdline"])[:240],
+                    "scripts": sorted(matched),
                 }
             )
     except (psutil.Error, OSError) as exc:
@@ -142,6 +157,16 @@ def find_managed_processes(
             "macOS/Windows 请重新安装 requirements.txt 中的 psutil"
         ) from exc
     return sorted(found, key=lambda item: item["pid"])
+
+
+def find_managed_processes(
+    root: str | os.PathLike[str],
+    script_names: tuple[str, ...] | list[str],
+) -> list[dict]:
+    return [
+        {key: value for key, value in item.items() if key != "scripts"}
+        for item in find_managed_processes_detailed(root, script_names)
+    ]
 
 
 def write_pid_file(
