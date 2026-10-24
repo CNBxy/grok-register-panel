@@ -7,6 +7,7 @@
 - 面板从原始 RFC822 邮件提取 xAI 验证码，按收件地址写入共享内存池目录
   （跨进程：面板接收、批量 worker 取码），TTL 过期自动清理。
 - 注册时按域名生成随机 catch-all 地址（无需建号 API），随后轮询取码。
+- 可选开启随机 1-7 级子域；收信侧必须支持泛子域 catch-all。
 
 面板 HTTP 层只负责鉴权与请求体校验；邮件解码 / 取码 / 池管理在本模块。
 """
@@ -16,7 +17,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import random
 import re
+import string
 import threading
 import time
 from pathlib import Path
@@ -276,8 +279,74 @@ def parse_domains(raw: object) -> list[str]:
     return domains
 
 
-def create_mailbox(domains: object, username: str = "") -> Tuple[str, str]:
-    """catch-all 模式：随机地址即建即用，无需邮箱创建接口。"""
+_RANDOM_LEVELS_RE = re.compile(r"^\s*(\d{1,2})\s*[-~]\s*(\d{1,2})\s*$")
+_RANDOM_LEVELS_MODES = {"1-7", "1~7", "1..7", "random", "true", "on", "yes"}
+_RANDOM_LEVELS_OFF = {"", "0", "false", "off", "no", "none", "root"}
+
+
+def random_subdomain_level_count(mode: object, rng: random.Random | None = None) -> int:
+    """Resolve the configured mode to a 1-7 subdomain label count.
+
+    ``0`` / false / off keeps the configured root domain.  ``1-7`` (or true)
+    picks a random depth per mailbox.  Fixed values and ranges are accepted
+    too, which makes the generator easy to test and configure.
+    """
+    rng = rng or random.SystemRandom()
+    raw = str(mode or "").strip().lower()
+    if raw in _RANDOM_LEVELS_OFF:
+        return 0
+    if raw in _RANDOM_LEVELS_MODES:
+        return rng.randint(1, 7)
+    match = _RANDOM_LEVELS_RE.fullmatch(raw)
+    if match:
+        low = max(1, min(7, int(match.group(1))))
+        high = max(1, min(7, int(match.group(2))))
+        if low > high:
+            low, high = high, low
+        return rng.randint(low, high)
+    if raw.isdigit():
+        return max(0, min(7, int(raw)))
+    return 0
+
+
+def _random_subdomain_label(rng: random.Random) -> str:
+    length = rng.randint(4, 10)
+    first = rng.choice(string.ascii_lowercase)
+    rest = "".join(
+        rng.choice(string.ascii_lowercase + string.digits)
+        for _ in range(length - 1)
+    )
+    return first + rest
+
+
+def _apply_random_subdomains(
+    domain: str,
+    mode: object,
+    rng: random.Random | None = None,
+) -> str:
+    rng = rng or random.SystemRandom()
+    levels = random_subdomain_level_count(mode, rng)
+    if levels <= 0:
+        return domain
+    labels = [_random_subdomain_label(rng) for _ in range(levels)]
+    candidate = ".".join(labels + [domain])
+    while labels and len(candidate) > 253:
+        labels.pop()
+        candidate = ".".join(labels + [domain])
+    return candidate
+
+
+def create_mailbox(
+    domains: object,
+    username: str = "",
+    random_subdomain_levels: object = "0",
+    rng: random.Random | None = None,
+) -> Tuple[str, str]:
+    """catch-all 模式：随机地址即建即用，无需邮箱创建接口。
+
+    ``random_subdomain_levels`` accepts ``"1-7"`` (random depth per address),
+    ``"0"`` (root domain), a fixed 1-7, or a range such as ``"1-3"``.
+    """
     cleaned = parse_domains(domains)
     if not cleaned:
         raise Exception(
@@ -287,7 +356,12 @@ def create_mailbox(domains: object, username: str = "") -> Tuple[str, str]:
     with _domain_lock:
         domain = cleaned[_domain_index % len(cleaned)]
         _domain_index += 1
-    address = f"{(username or generate_username(10)).lower()}@{domain}"
+    address_domain = _apply_random_subdomains(
+        domain,
+        random_subdomain_levels,
+        rng,
+    )
+    address = f"{(username or generate_username(10)).lower()}@{address_domain}"
     return address, SOURCE_LABEL
 
 

@@ -50,7 +50,7 @@ PROVIDER_HINTS = {
     "cloudmail": "域名邮箱，容易被拒，不推荐作为主路径",
     "moemail": "域名邮箱，容易被拒，不推荐作为主路径",
     "inbucket": "自建域名邮箱，容易被拒，不推荐作为主路径",
-    "openai_cpa": "Webhook 接收验证码的域名邮箱，需面板在线收推送；容易被拒，不推荐作为主路径",
+    "openai_cpa": "Webhook 接收验证码的域名邮箱，需面板在线收推送；开启随机层级子域需收信侧支持泛子域 catch-all；容易被拒，不推荐作为主路径",
 }
 RECOMMENDED_PROVIDERS = ("outlook_rt",)
 DOMAIN_PROVIDERS = tuple(
@@ -237,6 +237,18 @@ FIELD_DEFINITIONS = {
         "secret": True,
         "placeholder": "与邮件 Worker 的 X-Webhook-Secret 一致",
     },
+    "openai_cpa_random_subdomain_levels": {
+        "label": "随机层级子域",
+        "type": "select",
+        "default": "0",
+        "options": [
+            {"value": "0", "label": "关闭（使用根域名）"},
+            {
+                "value": "1-7",
+                "label": "开启（随机 1-7 级子域，需泛域收信）",
+            },
+        ],
+    },
 }
 
 PROVIDER_FIELDS = {
@@ -273,7 +285,11 @@ PROVIDER_FIELDS = {
         "outlook_rt_client_id",
     ),
     "inbucket": ("inbucket_api_base", "inbucket_domain", "inbucket_random_levels"),
-    "openai_cpa": ("openai_cpa_webhook_secret", "defaultDomains"),
+    "openai_cpa": (
+        "openai_cpa_webhook_secret",
+        "defaultDomains",
+        "openai_cpa_random_subdomain_levels",
+    ),
 }
 
 SECRET_FIELDS = {

@@ -246,6 +246,8 @@ DEFAULT_CONFIG = {
     "inbucket_random_levels": "0",
     # OpenAI-CPA 内存池：与邮件 Worker 通信密钥（X-Webhook-Secret）
     "openai_cpa_webhook_secret": "",
+    # 0=根域名；1-7=每个邮箱随机 1-7 级子域（需泛域 catch-all）
+    "openai_cpa_random_subdomain_levels": "0",
     # Outlook MSA refresh_token 库存（jsonl: email + refresh_token）
     "outlook_rt_inventory": "",
     "outlook_rt_used_path": "",
@@ -1838,7 +1840,10 @@ def openai_cpa_get_email_and_token(domain=""):
             "（与邮件 Worker 的 X-Webhook-Secret 一致），且面板在线接收推送"
         )
     address, token = openai_cpa_provider.create_mailbox(
-        str(domain or "").strip() or config.get("defaultDomains", "")
+        str(domain or "").strip() or config.get("defaultDomains", ""),
+        random_subdomain_levels=config.get(
+            "openai_cpa_random_subdomain_levels", "0"
+        ),
     )
     print(f"[*] 已生成 OpenAI-CPA catch-all 邮箱: {address}")
     return address, token
@@ -3161,6 +3166,12 @@ class GrokRegisterGUI:
         self.openai_cpa_webhook_secret_var = tk.StringVar(
             value=str(config.get("openai_cpa_webhook_secret", "") or "")
         )
+        _cpa_random_mode = str(
+            config.get("openai_cpa_random_subdomain_levels", "0") or "0"
+        ).strip().lower()
+        self.openai_cpa_random_subdomain_var = tk.BooleanVar(
+            value=_cpa_random_mode not in {"", "0", "false", "off", "no", "none"}
+        )
         self._openai_cpa_widgets = [
             p_label(0, 0, "Webhook 密钥:"),
             p_field(
@@ -3175,7 +3186,18 @@ class GrokRegisterGUI:
             ),
             p_label(0, 2, "收信域名:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.default_domains_var, width=34), 0, 3),
-            p_label(1, 0, "说明:"),
+            p_label(1, 2, "随机层级:"),
+            p_field(
+                tk_checkbutton(
+                    self.provider_frame,
+                    text="随机 1-7 级子域（需泛域收信）",
+                    variable=self.openai_cpa_random_subdomain_var,
+                ),
+                1,
+                3,
+                sticky=tk.W,
+            ),
+            p_label(2, 0, "说明:"),
             p_field(
                 tk_label(
                     self.provider_frame,
@@ -3185,7 +3207,7 @@ class GrokRegisterGUI:
                     wraplength=420,
                     justify=tk.LEFT,
                 ),
-                1,
+                2,
                 1,
                 columnspan=3,
                 sticky=tk.W,
@@ -3492,6 +3514,9 @@ class GrokRegisterGUI:
                 or outlook_rt_provider.DEFAULT_CLIENT_ID
             )
             config["openai_cpa_webhook_secret"] = self.openai_cpa_webhook_secret_var.get().strip()
+            config["openai_cpa_random_subdomain_levels"] = (
+                "1-7" if bool(self.openai_cpa_random_subdomain_var.get()) else "0"
+            )
             config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
             config["quality_probe_on_register"] = bool(self.quality_probe_on_register_var.get())
             _mode_text = str(self.cpa_token_mode_var.get()).strip()
@@ -3616,6 +3641,9 @@ class GrokRegisterGUI:
             or outlook_rt_provider.DEFAULT_CLIENT_ID
         )
         config["openai_cpa_webhook_secret"] = self.openai_cpa_webhook_secret_var.get().strip()
+        config["openai_cpa_random_subdomain_levels"] = (
+            "1-7" if bool(self.openai_cpa_random_subdomain_var.get()) else "0"
+        )
         config["cpa_auto_add"] = bool(self.cpa_auto_add_var.get())
         config["quality_probe_on_register"] = bool(self.quality_probe_on_register_var.get())
         _mode_text = str(self.cpa_token_mode_var.get()).strip()

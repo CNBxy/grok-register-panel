@@ -77,6 +77,17 @@ def test_provider_schema_and_defaults():
         assert {field["name"] for field in providers["openai_cpa"]["fields"]} == {
             "openai_cpa_webhook_secret",
             "defaultDomains",
+            "openai_cpa_random_subdomain_levels",
+        }
+        cpa_random_levels = next(
+            field
+            for field in providers["openai_cpa"]["fields"]
+            if field["name"] == "openai_cpa_random_subdomain_levels"
+        )
+        assert cpa_random_levels["default"] == "0"
+        assert {item["value"] for item in cpa_random_levels["options"]} == {
+            "0",
+            "1-7",
         }
         assert {field["name"] for field in providers["inbucket"]["fields"]} == {
             "inbucket_api_base",
@@ -335,15 +346,18 @@ def test_openai_cpa_secret_masking_and_webhook_secret_reader():
                 {
                     "openai_cpa_webhook_secret": "webhook-secret-value",
                     "defaultDomains": "Mail.Example.com, mail.example.com",
+                    "openai_cpa_random_subdomain_levels": "1-7",
                 },
             )
             assert saved["provider"] == "openai_cpa"
             assert saved["configured"] is True
             assert saved["values"]["openai_cpa_webhook_secret"] == ""
+            assert saved["values"]["openai_cpa_random_subdomain_levels"] == "1-7"
             assert saved["secret_configured"]["openai_cpa_webhook_secret"] is True
             raw = json.loads(config_path.read_text(encoding="utf-8"))
             assert raw["openai_cpa_webhook_secret"] == "webhook-secret-value"
             assert raw["defaultDomains"] == "mail.example.com"
+            assert raw["openai_cpa_random_subdomain_levels"] == "1-7"
             assert (
                 email_provider_store.read_webhook_secret() == "webhook-secret-value"
             )

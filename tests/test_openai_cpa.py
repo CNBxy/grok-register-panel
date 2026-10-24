@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
 import sys
 import tempfile
 import time
@@ -77,6 +79,65 @@ def test_parse_domains_and_rotation():
     local, _, domain = auto.partition("@")
     assert domain == "mail.example.test"
     assert "@" in local or ("." in local or "_" in local or local.isalnum())
+
+
+def test_random_subdomain_levels():
+    rng = random.Random(42)
+    openai_cpa._domain_index = 0
+    address, _ = openai_cpa.create_mailbox(
+        "example.com",
+        "tester",
+        random_subdomain_levels="0",
+        rng=rng,
+    )
+    assert address == "tester@example.com"
+
+    openai_cpa._domain_index = 0
+    address, _ = openai_cpa.create_mailbox(
+        "example.com",
+        "tester",
+        random_subdomain_levels="3",
+        rng=rng,
+    )
+    local, domain = address.split("@", 1)
+    labels = domain.split(".")
+    assert local == "tester"
+    assert len(labels) == 2 + 3
+    for label in labels[:3]:
+        assert re.fullmatch(r"[a-z][a-z0-9]{3,9}", label), label
+    assert labels[-2:] == ["example", "com"]
+
+    openai_cpa._domain_index = 0
+    address, _ = openai_cpa.create_mailbox(
+        "example.com",
+        "tester",
+        random_subdomain_levels="1-7",
+        rng=rng,
+    )
+    extra = len(address.split("@", 1)[1].split(".")) - 2
+    assert 1 <= extra <= 7
+
+    openai_cpa._domain_index = 0
+    address, _ = openai_cpa.create_mailbox(
+        "example.com",
+        "tester",
+        random_subdomain_levels=True,
+        rng=rng,
+    )
+    extra = len(address.split("@", 1)[1].split(".")) - 2
+    assert 1 <= extra <= 7
+
+
+def test_random_subdomain_level_count_modes():
+    rng = random.Random(7)
+    assert openai_cpa.random_subdomain_level_count("0", rng) == 0
+    assert openai_cpa.random_subdomain_level_count("off", rng) == 0
+    assert openai_cpa.random_subdomain_level_count("", rng) == 0
+    assert openai_cpa.random_subdomain_level_count("3", rng) == 3
+    assert openai_cpa.random_subdomain_level_count("1-7", rng) in range(1, 8)
+    assert openai_cpa.random_subdomain_level_count("1-3", rng) in range(1, 4)
+    assert openai_cpa.random_subdomain_level_count("99", rng) == 7
+    assert openai_cpa.random_subdomain_level_count("garbage", rng) == 0
 
 
 def test_store_pop_and_expiry():
@@ -376,6 +437,8 @@ def test_pool_file_permissions():
 
 if __name__ == "__main__":
     test_parse_domains_and_rotation()
+    test_random_subdomain_levels()
+    test_random_subdomain_level_count_modes()
     test_store_pop_and_expiry()
     test_decode_raw_email()
     test_accept_webhook_validation_matrix()
